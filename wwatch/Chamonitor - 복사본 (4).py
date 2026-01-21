@@ -104,7 +104,8 @@ class RuntimeConfig:
 
     beep_enabled: bool = True
 
-    preview_shot_no: int = 2
+    # ✅ 미리보기 표시할 사진 번호: 1=기본샷, 2=extra#1, 3=extra#2 ...
+    preview_shot_no: int = 2  # 기본 2번째(=extra#1)
 
     font_path: str = r"C:\Windows\Fonts\malgun.ttf"
     font_size: int = 24
@@ -141,6 +142,14 @@ class ChamWatcher(threading.Thread):
         self.stop_event.set()
 
     def compute_params(self):
+        """
+        sensitivity_level (1..10), 10=most sensitive
+        - motion_ratio: 0.030(lvl1) -> 0.008(lvl10)
+        - thresh:      35(lvl1) -> 20(lvl10)
+        - headlight filter adjustment with sensitivity:
+            luma_jump: 5.0(lvl1) -> 15.0(lvl10)
+            edge_min:  0.004(lvl1)-> 0.001(lvl10)
+        """
         with self.cfg_lock:
             lvl = int(self.cfg.sensitivity_level)
         lvl = max(1, min(10, lvl))
@@ -204,7 +213,9 @@ class ChamWatcher(threading.Thread):
         prev_edge = [None] * 4
         streak = [0] * 4
         last_saved_at = [0.0] * 4
-        pending = [[] for _ in range(4)]  # (due_time, event_ts, seq)
+
+        # pending extra shots: (due_time, event_ts, seq)
+        pending = [[] for _ in range(4)]
 
         self.log("Watching... (use Stop button)")
         self.emit({"type": "status", "running": True})
@@ -213,6 +224,7 @@ class ChamWatcher(threading.Thread):
             while not self.stop_event.is_set():
                 loop_start = time.time()
 
+                # cfg snapshot
                 with self.cfg_lock:
                     fps = int(self.cfg.fps)
                     blur_k = int(self.cfg.blur_k)
@@ -241,7 +253,7 @@ class ChamWatcher(threading.Thread):
                     view_idx = i + 1
                     now = time.time()
 
-                    # ---- pending extra shots ----
+                    # ---- handle pending extra shots ----
                     if pending[i]:
                         ready = [x for x in pending[i] if x[0] <= now]
                         pending[i] = [x for x in pending[i] if x[0] > now]
@@ -260,7 +272,7 @@ class ChamWatcher(threading.Thread):
                             except Exception as e:
                                 self.log(f"  FAILED extra save: {repr(e)}")
 
-                    # ---- capture ----
+                    # ---- normal capture ----
                     shot = np.array(sct.grab(roi))
                     bgr = cv2.cvtColor(shot, cv2.COLOR_BGRA2BGR)
                     gray = self.preprocess_gray(bgr, blur_k)
@@ -318,6 +330,7 @@ class ChamWatcher(threading.Thread):
                         if beep_enabled:
                             do_beep()
 
+                        # ---- save (base + extras) ----
                         if now - last_saved_at[i] >= cooldown:
                             event_ts = safe_timestamp()
                             try:
@@ -352,7 +365,7 @@ class ChamWatcher(threading.Thread):
 
 
 class App(tk.Tk):
-    RECENT_WINDOW_SEC = 8.0
+    RECENT_WINDOW_SEC = 8.0  # 최근 감지 표시 유지시간(초)
 
     def __init__(self):
         super().__init__()
@@ -365,7 +378,7 @@ class App(tk.Tk):
         self.eventq = queue.Queue()
         self.watcher = None
 
-        # ✅ 체크 상태 로드(프로그램 재실행해도 유지)
+        # ✅ 수동 확인(체크) 상태 저장
         self.checked = set()
         self._load_checked()
 
@@ -401,11 +414,6 @@ class App(tk.Tk):
         self._build_styles()
         self._build_ui()
 
-        # ✅ (중요) 실행 전 저장돼 있던 캡쳐들도 로딩
-        self._load_existing_captures_to_memory()
-        self._goto_latest_if_exists()  # 있으면 바로 최신으로 보여줌
-        self._update_capture_count()
-
         self.after(100, self._poll_logs)
         self.after(100, self._poll_events)
         self.after(500, self._update_capture_count_loop)
@@ -433,61 +441,6 @@ class App(tk.Tk):
             )
         except Exception:
             pass
-
-    # -------------------------
-    # ✅ 기존 캡쳐 파일도 로딩
-    # -------------------------
-    def _load_existing_captures_to_memory(self):
-        SAVE_DIR.mkdir(parents=True, exist_ok=True)
-        patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"]
-
-        files = []
-        for pat in patterns:
-            files.extend(list(SAVE_DIR.glob(pat)))
-
-        # reset
-        self.saved_by_gate_seq = {1: {}, 2: {}, 3: {}, 4: {}}
-
-        for p in files:
-            fn = p.name
-            gate = self._infer_gate_from_filename(fn)
-            seq = self._infer_seq_from_filename(fn)
-            if gate in (1, 2, 3, 4):
-                # 같은 gate/seq에 중복이 있으면 더 최신(파일명 큰것)으로
-                old = self.saved_by_gate_seq[gate].get(seq)
-                if (old is None) or (fn > old):
-                    self.saved_by_gate_seq[gate][seq] = fn
-
-        # latest ref도 갱신
-        items = self._list_all_saved_files()
-        if items:
-            fn, gate, seq = items[-1]
-            self.latest_saved_ref = (gate, seq, fn)
-
-    def _infer_gate_from_filename(self, filename: str) -> int | None:
-        for g, name in GATE_NAMES.items():
-            if name in filename:
-                return g
-        return None
-
-    def _infer_seq_from_filename(self, filename: str) -> int:
-        try:
-            stem = Path(filename).stem
-            parts = stem.split("_")
-            last = parts[-1]
-            if last.isdigit():
-                return int(last)
-        except Exception:
-            pass
-        return 0
-
-    def _goto_latest_if_exists(self):
-        items = self._list_all_saved_files()
-        if not items:
-            self._sync_checked_ui()
-            return
-        fn, gate, seq = items[-1]
-        self._jump_to_global_item(fn, gate, seq)
 
     # -------------------------
     # Styles
@@ -559,12 +512,14 @@ class App(tk.Tk):
         )
         self.spin_interval.pack(side=tk.LEFT)
 
+        # ✅ 미리보기 사진 번호 선택
         ttk.Label(top, text="미리보기(1~5):").pack(side=tk.LEFT, padx=(16, 5))
         self.preview_no_var = tk.IntVar(value=self.cfg.preview_shot_no)
         self.spin_preview_no = ttk.Spinbox(top, from_=1, to=5, textvariable=self.preview_no_var, width=3,
                                            command=self.apply_settings)
         self.spin_preview_no.pack(side=tk.LEFT)
 
+        # ✅ 자동 따라가기 체크박스
         self.auto_follow_var = tk.BooleanVar(value=True)
         self.chk_autofollow = ttk.Checkbutton(top, text="자동 따라가기", variable=self.auto_follow_var)
         self.chk_autofollow.pack(side=tk.LEFT, padx=(14, 5))
@@ -590,10 +545,11 @@ class App(tk.Tk):
         self.params_label = ttk.Label(info, text="")
         self.params_label.pack(side=tk.LEFT)
 
-        # ===== MAIN =====
+        # ===== MAIN (Grid Layout) =====
         main = ttk.Frame(self, padding=10)
         main.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
+        # 2 columns: left(log+status), right(preview)
         main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=3)
         main.grid_columnconfigure(1, weight=1)
@@ -665,7 +621,7 @@ class App(tk.Tk):
 
             self.gate_rows[g] = (lbl_time, lbl_count, lbl_file)
 
-        # ===== RIGHT: PREVIEW =====
+        # ===== RIGHT: PREVIEW ONLY =====
         preview = ttk.LabelFrame(right, text="미리보기", padding=10)
         preview.configure(width=520, height=360)
         preview.grid_propagate(False)
@@ -674,6 +630,7 @@ class App(tk.Tk):
         preview.pack_propagate(False)
         preview.grid_propagate(False)
 
+        # 상단바 + 이미지 + 하단 체크라인
         preview.grid_rowconfigure(0, weight=0)
         preview.grid_rowconfigure(1, weight=1)
         preview.grid_rowconfigure(2, weight=0)
@@ -697,18 +654,19 @@ class App(tk.Tk):
         self.btn_next_gate.grid(row=0, column=2, sticky="e")
         self.btn_latest.grid(row=0, column=3, padx=(12, 0), sticky="e")
 
+        # ✅ 이미지 표시 영역
         self.preview_label = tk.Label(preview, bg="black")
         self.preview_label.grid(row=1, column=0, sticky="nsew")
+
         self.preview_label.bind("<Configure>", self._on_preview_configure)
 
-        # ✅ 체크 + 상태 아이콘
+        # ✅ 수동 확인 체크 라인
         checkline = ttk.Frame(preview)
         checkline.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         checkline.grid_columnconfigure(0, weight=1)
         checkline.grid_columnconfigure(1, weight=0)
 
-        # 왼쪽 상태표시 (✅ 확인됨 / ❌ 미확인)
-        self.lbl_checked_mark = ttk.Label(checkline, text="", font=("Arial", 11, "bold"))
+        self.lbl_checked_mark = ttk.Label(checkline, text="", foreground="green")
         self.lbl_checked_mark.grid(row=0, column=0, sticky="w")
 
         self.chk_confirm = ttk.Checkbutton(
@@ -721,16 +679,15 @@ class App(tk.Tk):
         bottom = ttk.Frame(self, padding=(10, 0, 10, 10))
         bottom.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # ✅ 총 캡쳐 수 + 미확인 수
-        self.capture_count_label = ttk.Label(bottom, text="총 캡쳐 수 : 0 / 미확인 : 0", anchor="e")
+        self.capture_count_label = ttk.Label(bottom, text="captures: 0", anchor="e")
         self.capture_count_label.pack(side=tk.RIGHT)
-
         self.btn_open_folder = ttk.Button(bottom, text="captures 폴더 열기", command=self.open_captures_folder)
         self.btn_clear_folder = ttk.Button(bottom, text="captures 사진 전부 삭제", command=self.clear_captures_folder)
         self.btn_open_folder.pack(side=tk.RIGHT, padx=5)
         self.btn_clear_folder.pack(side=tk.RIGHT, padx=5)
 
         self.apply_settings()
+        self._update_capture_count()
 
     # -------------------------
     # Preview resize (debounced)
@@ -749,6 +706,9 @@ class App(tk.Tk):
             self._render_preview_image(self.current_preview_path)
 
     def _render_preview_image(self, img_path: Path):
+        """
+        ✅ 늘리지 않고(축소만) / 비율 유지 / 현재 preview_label 크기에 맞춰 표시
+        """
         try:
             if not img_path.exists():
                 return
@@ -786,7 +746,7 @@ class App(tk.Tk):
         return motion_ratio, thresh, luma_jump, edge_ratio_min
 
     # -------------------------
-    # Settings apply
+    # Settings apply + fallback
     # -------------------------
     def apply_settings(self):
         lvl = self._safe_int(self.sens_var.get(), default=self.cfg.sensitivity_level, min_v=1, max_v=10)
@@ -891,17 +851,9 @@ class App(tk.Tk):
                     failed += 1
 
         self._log_ui(f"=== CLEAR captures === deleted={deleted}, failed={failed}")
+        self._update_capture_count()
 
-        # 메모리 상태 초기화
         self.saved_by_gate_seq = {1: {}, 2: {}, 3: {}, 4: {}}
-        self.latest_saved_ref = None
-        self.current_preview_path = None
-        self.preview_label.config(image="")
-        self.preview_imgtk = None
-
-        # 체크도 초기화
-        self.checked = set()
-        self._save_checked()
 
         for g in range(1, 5):
             self.last_saved_file[g] = "-"
@@ -911,12 +863,15 @@ class App(tk.Tk):
         self.last_global_saved = "-"
         self.lbl_last_save.config(text="마지막 저장: -")
 
-        self._sync_checked_ui()
-        self._update_capture_count()
+        self.preview_label.config(image="")
+        self.preview_imgtk = None
+        self.current_preview_path = None
 
-    # -------------------------
-    # counts
-    # -------------------------
+        # ✅ 체크 데이터도 같이 정리
+        self.checked = set()
+        self._save_checked()
+        self._sync_checked_ui()
+
     def _count_capture_images(self) -> int:
         if not SAVE_DIR.exists():
             return 0
@@ -926,23 +881,9 @@ class App(tk.Tk):
             total += sum(1 for _ in SAVE_DIR.glob(pat))
         return total
 
-    def _list_existing_image_names(self):
-        SAVE_DIR.mkdir(parents=True, exist_ok=True)
-        patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"]
-        names = []
-        for pat in patterns:
-            for p in SAVE_DIR.glob(pat):
-                names.append(p.name)
-        return names
-
     def _update_capture_count(self):
-        names = self._list_existing_image_names()
-        total = len(names)
-
-        # ✅ 실제로 존재하는 것 중에서만 미확인 계산
-        unchecked = sum(1 for n in names if n not in self.checked)
-
-        self.capture_count_label.config(text=f"총 캡쳐 수 : {total} / 미확인 : {unchecked}")
+        n = self._count_capture_images()
+        self.capture_count_label.config(text=f"총 캡쳐 수 : {n}")
 
     def _update_capture_count_loop(self):
         self._update_capture_count()
@@ -972,15 +913,22 @@ class App(tk.Tk):
         self.after(250, self._update_recent_colors_loop)
 
     # -------------------------
-    # Global list navigation
+    # ✅ Global list navigation (최신이면 더 이상 이동 금지)
     # -------------------------
     def _list_all_saved_files(self):
+        """
+        saved_by_gate_seq 기반으로 현재 알려진 파일들을 전부 모아서
+        filename 기준(시간순) 정렬한 리스트 반환.
+        """
         items = []
         for gate in (1, 2, 3, 4):
             seq_map = self.saved_by_gate_seq.get(gate, {})
             for seq, fn in seq_map.items():
                 if isinstance(fn, str) and fn:
                     items.append((fn, gate, seq))
+
+        # filename이 "YYYYmmdd_HHMMSS_게이트_XX.png" 형태라
+        # lexicographic sort = 시간정렬이 거의 그대로 됨
         items.sort(key=lambda x: x[0])
         return items
 
@@ -1002,32 +950,50 @@ class App(tk.Tk):
         self.preview_gate_label.config(text=f"{GATE_NAMES.get(gate, gate)}")
         self.current_preview_path = path
         self._render_preview_image(path)
-
         self.latest_saved_ref = (gate, seq, fn)
         self._sync_checked_ui()
-        self._update_capture_count()
+
+    # -------------------------
+    # Preview helpers
+    # -------------------------
+    def _max_possible_shot_no(self) -> int:
+        with self.cfg_lock:
+            extra = int(getattr(self.cfg, "extra_shots", 2))
+        extra = max(0, min(5, extra))
+        return 1 + extra
 
     def next_preview_shot(self):
+        """
+        ✅ 현재가 전역 리스트에서 최신(마지막)이면 이동 안함
+        """
         idx, items = self._get_current_index_in_global()
         if not items:
             return
 
+        # current 없으면 -> 최신으로
         if idx is None:
             fn, gate, seq = items[-1]
             self._jump_to_global_item(fn, gate, seq)
             return
 
+        # 최신이면 더 이상 이동 X
         if idx >= len(items) - 1:
-            return  # 최신이면 이동 금지
+            # (원하면 여기서 메시지 띄울 수도 있음)
+            # messagebox.showinfo("Info", "이미 가장 최근 샷입니다.")
+            return
 
         fn, gate, seq = items[idx + 1]
         self._jump_to_global_item(fn, gate, seq)
 
     def prev_preview_shot(self):
+        """
+        ✅ 현재가 전역 리스트에서 가장 과거(첫번째)이면 이동 안함
+        """
         idx, items = self._get_current_index_in_global()
         if not items:
             return
 
+        # current 없으면 -> 가장 오래된걸로
         if idx is None:
             fn, gate, seq = items[0]
             self._jump_to_global_item(fn, gate, seq)
@@ -1039,6 +1005,43 @@ class App(tk.Tk):
         fn, gate, seq = items[idx - 1]
         self._jump_to_global_item(fn, gate, seq)
 
+    def refresh_preview_for_current_gate(self):
+        """
+        기존 로직 유지:
+        - auto-follow에서 gate별로 볼 때 유용
+        """
+        with self.cfg_lock:
+            preview_shot_no = int(getattr(self.cfg, "preview_shot_no", 2))
+            extra_shots = int(getattr(self.cfg, "extra_shots", 2))
+
+        max_possible = 1 + max(0, min(5, extra_shots))
+        if preview_shot_no > max_possible:
+            preview_shot_no = max_possible
+
+        wanted_seq = max(0, min(4, preview_shot_no - 1))
+
+        seq_map = self.saved_by_gate_seq.get(self.preview_gate, {})
+        if not seq_map:
+            self.preview_label.config(image="")
+            self.preview_imgtk = None
+            self.current_preview_path = None
+            self._sync_checked_ui()
+            return
+
+        candidates = sorted(seq_map.keys())
+        if wanted_seq in seq_map:
+            chosen_seq = wanted_seq
+        else:
+            below = [s for s in candidates if s <= wanted_seq]
+            chosen_seq = max(below) if below else max(candidates)
+
+        filename = seq_map.get(chosen_seq)
+        if filename:
+            path = SAVE_DIR / filename
+            self.current_preview_path = path
+            self._render_preview_image(path)
+            self._sync_checked_ui()
+
     def goto_latest_shot(self):
         items = self._list_all_saved_files()
         if not items:
@@ -1048,24 +1051,23 @@ class App(tk.Tk):
         self._jump_to_global_item(fn, gate, seq)
 
     # -------------------------
-    # Manual checked toggle + UI sync
+    # ✅ Manual checked toggle + UI sync
     # -------------------------
     def _sync_checked_ui(self):
+        """
+        current_preview_path 기준으로 체크 UI / 녹색 표시 반영
+        """
         self._check_updating = True
         try:
             if not self.current_preview_path:
                 self._check_var.set(False)
-                self.lbl_checked_mark.config(text="", foreground="gray")
+                self.lbl_checked_mark.config(text="")
                 return
 
             name = self.current_preview_path.name
             is_checked = (name in self.checked)
             self._check_var.set(is_checked)
-
-            if is_checked:
-                self.lbl_checked_mark.config(text="✅ 확인됨", foreground="green")
-            else:
-                self.lbl_checked_mark.config(text="❌ 미확인", foreground="red")
+            self.lbl_checked_mark.config(text=("✅ 확인됨" if is_checked else ""))
         finally:
             self._check_updating = False
 
@@ -1073,6 +1075,7 @@ class App(tk.Tk):
         if self._check_updating:
             return
         if not self.current_preview_path:
+            # 체크할 이미지가 없는데 눌렀으면 다시 해제
             self._check_updating = True
             self._check_var.set(False)
             self._check_updating = False
@@ -1089,7 +1092,6 @@ class App(tk.Tk):
 
         self._save_checked()
         self._sync_checked_ui()
-        self._update_capture_count()
 
     # -------------------------
     # Event polling
@@ -1108,11 +1110,14 @@ class App(tk.Tk):
 
             elif etype == "detected":
                 gate = int(ev.get("gate", 0))
+                ratio = float(ev.get("ratio", 0.0))
                 when = ev.get("when", "-")
 
                 if gate in self.gate_rows:
+                    self.last_ratio[gate] = ratio
                     self.last_detect_time[gate] = when
                     self.last_detect_epoch[gate] = time.time()
+
                     self.detect_count[gate] += 1
 
                     lbl_time, lbl_count, lbl_file = self.gate_rows[gate]
@@ -1125,6 +1130,7 @@ class App(tk.Tk):
                 if self.auto_follow_var.get() and gate in (1, 2, 3, 4):
                     self.preview_gate = gate
                     self.preview_gate_label.config(text=GATE_NAMES[self.preview_gate])
+                    self.refresh_preview_for_current_gate()
 
             elif etype == "saved":
                 gate = int(ev.get("gate", 0))
@@ -1140,19 +1146,18 @@ class App(tk.Tk):
                 self.last_global_saved = f"{GATE_NAMES.get(gate, gate)} -> {filename}"
                 self.lbl_last_save.config(text=f"마지막 저장: {self.last_global_saved}")
 
-                # ✅ 메모리 기록
+                # ✅ gate/seq별 파일 기록
                 if gate in self.saved_by_gate_seq and isinstance(filename, str) and filename != "-":
                     self.saved_by_gate_seq[gate][seq] = filename
 
-                # ✅ latest 갱신
+                # ✅ 전역 최신 ref 갱신
                 self.latest_saved_ref = (gate, seq, filename)
 
-                # ✅ 자동 따라가기면 화면 갱신
+                # ✅ 현재 보고 있는 게이트와 같으면 갱신
                 if gate == self.preview_gate:
                     self.current_preview_path = SAVE_DIR / filename
                     self._render_preview_image(self.current_preview_path)
                     self._sync_checked_ui()
-                    self._update_capture_count()
 
         self.after(100, self._poll_events)
 
